@@ -26,8 +26,7 @@ until all accounts were banned, scrap stop.
 # please set this to your own, this is fake accounts
 accounts = [
     {
-        "id": 'jintianiloveu',
+        "id": '15603014132',
         "password": '77888',
     },
-
 ]

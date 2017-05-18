@@ -16,3 +16,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ------------------------------------------------------------------------
+class CookiesOutdated(Exception):
+    def __init__(self):
+        self.msg = 'Cookies out of date'
+
+class AccountBanned(Exception):
+    def __init__(self):
+        self.msg = 'Current weibo account is banned'

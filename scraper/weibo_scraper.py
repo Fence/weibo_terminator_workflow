@@ -28,24 +28,22 @@ if you care about security, using subsidiary accounts instead.
 
 """
 import re
-import sys
 import os
-import requests
-from lxml import etree
-import traceback
-from settings.config import COOKIES_SAVE_PATH
-import pickle
 import time
-from utils.string import is_number
+import pickle
+import requests
 import numpy as np
+from lxml import etree
 from settings.config import *
-import logging
+from utils.connection import *
 
 
 class WeiBoScraper(object):
-    def __init__(self, using_account, scrap_id, cookies, filter_flag=0):
+
+    def __init__(self, using_account, scrap_id, cookies, error_page, filter_flag=0):
         self.using_account = using_account
         self.cookies = cookies
+        self.error_page = error_page
 
         self._init_cookies()
         self._init_headers()
@@ -65,10 +63,16 @@ class WeiBoScraper(object):
         self.rest_time = 20
         self.rest_min_time = 20  # create random rest time
         self.rest_max_time = 30
+        self.rest_page = 5
+        self.rest_min_page = 5   # create random number for continuous pages
+        self.rest_max_page = 10
+        self.raise_error_page = 20
+        self.jump_error_page = -1
 
         self.weibo_content_save_file = os.path.join(CORPUS_SAVE_DIR, 'weibo_content.pkl')
-        self.weibo_content_and_comment_save_file = os.path.join(CORPUS_SAVE_DIR, 'weibo_content_and_comment.pkl')
-        self.weibo_fans_save_file = os.path.join(CORPUS_SAVE_DIR, 'weibo_fans.pkl')
+        self.weibo_content_and_comment_save_file = os.path.join(
+            CORPUS_SAVE_DIR, 'weibo_content_and_comment.pkl')
+        self.weibo_fans_save_file = os.path.join(CORPUS_SAVE_DIR, 'weibo_fans.txt')
         self.big_v_ids_file = os.path.join(CORPUS_SAVE_DIR, 'big_v_ids.txt')
 
     def _init_cookies(self):
@@ -96,8 +100,8 @@ class WeiBoScraper(object):
         :return:
         """
         if os.path.exists(SCRAPED_MARK):
-            with open(SCRAPED_MARK, 'rb') as f:
-                scraped_ids = pickle.load(f)
+            with open(SCRAPED_MARK) as f:
+                scraped_ids = f.read().split('\n')
             if self.scrap_id in scraped_ids:
                 return True
             else:
@@ -106,9 +110,11 @@ class WeiBoScraper(object):
             return False
 
     def crawl(self):
-        # this is the most time-cost part, we have to catch errors, return to dispatch center
+        # this is the most time-cost part, we have to catch errors, 
+        # return to dispatch center
         if self.jump_scraped_id():
             print('scrap id {} already scraped, directly pass it.'.format(self.scrap_id))
+            return True
         else:
             try:
                 self._get_html()
@@ -118,11 +124,18 @@ class WeiBoScraper(object):
                 self._get_fans_ids()
                 self._get_weibo_content()
                 self._get_weibo_content_and_comment()
+                self.mark_as_scraped(self.scrap_id)
                 return True
+            except CookiesOutdated as e:
+                print('\nRaise Exception in crawl, error:', e.msg)
+                raise CookiesOutdated()
+            except AccountBanned as e:
+                print('\nRaise Exception in crawl, error:', e.msg)
+                raise AccountBanned()
             except Exception as e:
-                logging.error(e)
-                print('some error above not catch, return to dispatch center, resign for new account..')
-                return False
+                print('Raise Exception in crawl, error:', e)
+                print('Some error above not catch, return to dispatch center, \
+                    \nresign for new account..')
 
     def _get_html(self):
         try:
@@ -131,20 +144,19 @@ class WeiBoScraper(object):
             self.html = requests.get(url, cookies=self.cookie, headers=self.headers).content
             print('success load html..')
         except Exception as e:
-            print(e)
+            print('Raise Exception in _get_html, error:', e)
 
     def _get_user_name(self):
-        print('\n' + '-' * 30)
+        print('\n' + '-'*30)
         print('getting user name')
         try:
             selector = etree.HTML(self.html)
             self.user_name = selector.xpath('//table//div[@class="ut"]/span[1]/text()')[0]
             print('current user name is: {}'.format(self.user_name))
         except Exception as e:
-            print(e)
-            print('html not properly loaded, maybe cookies out of date or account being banned. '
-                  'change an account please')
-            exit()
+            print('Raise Exception in _get_user_name, error:', e)
+            print('html not properly loaded, maybe cookies out of date or account being banned.\nIf so, change an account please')
+            raise AccountBanned()
 
     def _get_user_info(self):
         print('\n' + '-' * 30)
@@ -165,8 +177,9 @@ class WeiBoScraper(object):
         str_fs = selector.xpath("//div[@class='tip2']/a/text()")[1]
         guid = re.findall(pattern, str_fs, re.M)
         self.followers = int(guid[0])
-        print('current user all weibo num {}, following {}, followers {}'.format(self.weibo_num, self.following,
-                                                                                 self.followers))
+        print('current user all weibo num {}, following {}, followers {}'.format(
+            self.weibo_num, self.following, self.followers))
+
 
     def _get_fans_ids(self):
         """
@@ -174,8 +187,8 @@ class WeiBoScraper(object):
         which means every time you scrap an user, you will get a bunch of fans ids,
         more importantly, in this fans ids have no repeat one.
 
-        BEWARE THAT: this method will not execute if self.followers < 200, you can edit this
-        value.
+        BEWARE THAT: this method will not execute if self.followers < 200, 
+        you can edit this value.
         :return:
         """
         print('\n' + '-' * 30)
@@ -187,38 +200,37 @@ class WeiBoScraper(object):
                     print('Fans ids of big_v {} (id {}) have been saved before.'.format(
                         self.user_name, self.scrap_id))
                     return
-        print(self.followers)
+        print('total followers of {} : {}'.format(self.user_name, self.followers))
         if self.followers < 200:
             pass
         else:
             fans_ids = []
             if os.path.exists(self.weibo_fans_save_file):
-                with open(self.weibo_fans_save_file, 'rb') as f:
-                    fans_ids = pickle.load(f)
+                with open(self.weibo_fans_save_file) as f:
+                    fans_ids = f.read().split('\n')
 
             fans_url = 'https://weibo.cn/{}/fans?'.format(self.scrap_id)
             # first from fans html get how many page fans have
             # beware that, this
             print(fans_url)
-            # r = requests.get(fans_url, cookies=self.cookie, headers=self.headers).content
-            # print(r)
             html_fans = requests.get(fans_url, cookies=self.cookie, headers=self.headers).content
             selector = etree.HTML(html_fans)
             try:
-                if selector.xpath('//input[@name="mp"]') is None:
+                if not selector.xpath('//input[@name="mp"]'):# is None:
                     page_num = 1
                 else:
                     page_num = int(selector.xpath('//input[@name="mp"]')[0].attrib['value'])
                 print('all fans have {} pages.'.format(page_num))
-
+                self.rest_page = np.random.randint(self.rest_min_page, self.rest_max_page)
                 try:
                     for i in range(page_num):
-                        if i % 5 == 0 and i != 0:
+                        if i % self.rest_page == 0 and i != 0:
                             print('[REST] rest {}s for cheating....'.format(self.rest_time))
                             time.sleep(self.rest_time)
                         fans_url_child = 'https://weibo.cn/{}/fans?page={}'.format(self.scrap_id, i)
                         print('requesting fans url: {}'.format(fans_url))
-                        html_child = requests.get(fans_url_child, cookies=self.cookie, headers=self.headers).content
+                        html_child = requests.get(
+                            fans_url_child, cookies=self.cookie, headers=self.headers).content
                         selector_child = etree.HTML(html_child)
                         fans_ids_content = selector_child.xpath("//div[@class='c']/table//a[1]/@href")
                         ids = [i.split('/')[-1] for i in fans_ids_content]
@@ -227,31 +239,32 @@ class WeiBoScraper(object):
                             print('appending fans id {}'.format(d))
                             fans_ids.append(d)
                 except Exception as e:
-                    print('error: ', e)
+                    print('Raise Exception in inner _get_fans_ids, error:', e)
                     dump_fans_list = list(set(fans_ids))
                     print(dump_fans_list)
-                    with open(self.weibo_fans_save_file, 'wb') as f:
-                        pickle.dump(dump_fans_list, f)
+                    with open(self.weibo_fans_save_file, 'w') as f:
+                        f.write('\n'.join(dump_fans_list))
                     print('fans ids not fully added, but this is enough, saved into {}'.format(
                         self.weibo_fans_save_file))
 
                 dump_fans_list = list(set(fans_ids))
                 print(dump_fans_list)
-                with open(self.weibo_fans_save_file, 'wb') as f:
-                    pickle.dump(dump_fans_list, f)
+                with open(self.weibo_fans_save_file, 'w') as f:
+                    f.write('\n'.join(dump_fans_list))
                 with open(self.big_v_ids_file, 'a') as f:
                     f.write(self.scrap_id + '\n')
                 print('successfully saved fans id file into {}'.format(self.weibo_fans_save_file))
 
             except Exception as e:
-                logging.error(e)
+                print('Raise Exception in outer _get_fans_ids, error:', e)
+
 
     def _get_weibo_content(self):
         print('\n' + '-' * 30)
         print('getting weibo content...')
         selector = etree.HTML(self.html)
         try:
-            if selector.xpath('//input[@name="mp"]') is None:
+            if not selector.xpath('//input[@name="mp"]'):
                 page_num = 1
             else:
                 page_num = int(selector.xpath('//input[@name="mp"]')[0].attrib['value'])
@@ -267,19 +280,20 @@ class WeiBoScraper(object):
                     start_page = obj[self.scrap_id]['last_scrap_page']
             if start_page >= page_num:
                 print('\nAll weibo contents of {} have been scrapped before\n'.format(self.user_name))
-                return
+                return 
 
-            try:
-                # traverse all weibo, and we will got weibo detail urls
-                for page in range(start_page + 1, page_num + 1):
+            self.rest_page = np.random.randint(self.rest_min_page, self.rest_max_page)
+            # traverse all weibo, and we will got weibo detail urls
+            for page in range(start_page + 1, page_num + 1): 
+                try:
                     url2 = 'http://weibo.cn/%s?filter=%s&page=%s' % (self.scrap_id, self.filter, page)
                     html2 = requests.get(url2, cookies=self.cookie, headers=self.headers).content
                     selector2 = etree.HTML(html2)
                     content = selector2.xpath("//div[@class='c']")
                     print('\n---- current solving page {} of {}'.format(page, page_num))
 
-                    if page % 5 == 0:
-                        print('[REST] rest for %ds to cheat weibo site, avoid being banned.' % self.rest_time)
+                    if page % self.rest_page == 0:
+                        print('[REST] rest for %ds to cheat weibo site, avoid being banned.'%self.rest_time)
                         time.sleep(self.rest_time)
 
                     if len(content) > 3:
@@ -308,27 +322,20 @@ class WeiBoScraper(object):
                             guid = re.findall(pattern, comment, re.M)
                             num_comment = int(guid[0])
                             self.num_comment.append(num_comment)
-            except etree.XMLSyntaxError as e:
-                print('\n' * 2)
-                print('=' * 20)
-                print('weibo user {} all weibo content finished scrap.'.format(self.user_name))
-                print('all weibo {}, all like {}, all comments {}'.format(
-                    len(self.weibo_content), np.sum(self.num_zan), np.sum(self.num_comment)))
-                print('try saving weibo content for now...')
-                self._save_content(page)
-                # maybe should not need to release memory
-                # del self.weibo_content
-            except Exception as e:
-                print(e)
-                print('\n' * 2)
-                print('=' * 20)
-                print('weibo user {} content scrap error occured {}.'.format(self.user_name, e))
-                print('all weibo {}, all like {}, all comments {}'.format(
-                    len(self.weibo_content), np.sum(self.num_zan), np.sum(self.num_comment)))
-                print('try saving weibo content for now...')
-                self._save_content(page)
-                # del self.weibo_content
-                # should keep self.weibo_content
+                except etree.XMLSyntaxError as e:
+                    print('\n\netree.XMLSyntaxError: ', e)
+                    print('This page has no contents and is passed: ', e)
+
+                except Exception as e:
+                    print('Raise Exception in _get_weibo_content, error:', e)
+                    print('\n' * 2)
+                    print('=' * 20)
+                    print('weibo user {} content scrap error occured {}.'.format(self.user_name, e))
+                    print('all weibo {}, all like {}, all comments {}'.format(
+                        len(self.weibo_content), np.sum(self.num_zan), np.sum(self.num_comment)))
+                    print('try saving weibo content for now...')
+                    self._save_content(page - 1)
+
             print('\n' * 2)
             print('=' * 20)
             print('all weibo {}, all like {}, all comments {}'.format(
@@ -336,6 +343,7 @@ class WeiBoScraper(object):
             print('try saving weibo content for now...')
             self._save_content(page)
             del self.weibo_content
+
             if self.filter == 0:
                 print('共' + str(self.weibo_scraped) + '条微博')
             else:
@@ -343,8 +351,11 @@ class WeiBoScraper(object):
         except IndexError as e:
             print('get weibo info done, current user {} has no weibo yet.'.format(self.scrap_id))
         except KeyboardInterrupt:
-            print('manually interrupted... try save wb_content for now...')
+            print('\nManually interrupted... try save wb_content for now...')
             self._save_content(page - 1)
+            print('Program exit!\n')
+            exit()
+
 
     def _save_content(self, page):
         dump_obj = dict()
@@ -364,9 +375,10 @@ class WeiBoScraper(object):
         }
         with open(self.weibo_content_save_file, 'wb') as f:
             pickle.dump(dump_obj, f)
-        print('\nUser name: {} \t ID: {} '.format(self.user_name, self.scrap_id))
+        print('\nUser name: {} \t ID: {} '.format(self.user_name, self.scrap_id)) 
         print('[CHEER] weibo content saved into {}, finished this part successfully.\n'.format(
             self.weibo_content_save_file, page))
+
 
     def _get_weibo_content_and_comment(self):
         """
@@ -393,65 +405,89 @@ class WeiBoScraper(object):
         if os.path.exists(self.weibo_content_save_file):
             print('load previous weibo_content file from {}'.format(self.weibo_content_save_file))
             obj = pickle.load(open(self.weibo_content_save_file, 'rb'))
+            if self.scrap_id not in obj.keys():
+                print('\nID {} is not in self.weibo_content.keys()\n'.format(self.scrap_id))
+                return False
             self.weibo_content = obj[self.scrap_id]['weibo_content']
+                
 
         if os.path.exists(self.weibo_content_and_comment_save_file):
-            with open(self.weibo_content_and_comment_save_file, 'rb') as f:
-                obj = pickle.load(f)
-                if self.scrap_id in obj.keys():
-                    obj = obj[self.scrap_id]
-                    weibo_detail_urls = obj['weibo_detail_urls']
-                    start_scrap_index = obj['last_scrap_index']
-                    content_and_comment = obj['content_and_comment']
+            #with open(self.weibo_content_and_comment_save_file, 'rb') as f:
+            print('\nload previous weibo_content_and_comment file from {}'.format(
+                self.weibo_content_and_comment_save_file))
+            obj = pickle.load(open(self.weibo_content_and_comment_save_file, 'rb'))
+            if self.scrap_id in obj.keys():
+                obj = obj[self.scrap_id]
+                weibo_detail_urls = obj['weibo_detail_urls']
+                start_scrap_index = obj['last_scrap_index']
+                content_and_comment = obj['content_and_comment']
 
         end_scrap_index = len(weibo_detail_urls)
+        self.no_comment_weibo = 0
         try:
             for i in range(start_scrap_index + 1, end_scrap_index):
+                if self.no_comment_weibo > self.raise_error_page:
+                    raise CookiesOutdated()
                 url = weibo_detail_urls[i]
                 one_content_and_comment = dict()
 
-                print('\n\nsolving weibo detail from {}'.format(url))
-                print('No.{} weibo of total {}'.format(i, end_scrap_index))
+                print('\nsolving weibo detail from {}'.format(url))
+                print('\n{} No.{} weibo of total {}'.format(self.user_name, i, end_scrap_index))
+                print('Weibo content: {}'.format(self.weibo_content[i]))
+                print('Comments: \n\n')
                 html_detail = requests.get(url, cookies=self.cookie, headers=self.headers).content
                 selector_detail = etree.HTML(html_detail)
-                # if current weibo content has no comment, skip it
                 if not selector_detail.xpath('//*[@id="pagelist"]/form/div/input[1]/@value'):
+                    self.no_comment_weibo += 1
+                    print('\nself.no_comment_weibo: %d\n'%self.no_comment_weibo)
                     continue
                 all_comment_pages = selector_detail.xpath('//*[@id="pagelist"]/form/div/input[1]/@value')[0]
-                print('这是 {} 的微博：'.format(self.user_name))
-                print('微博内容： {}'.format(self.weibo_content[i]))
-                print('接下来是下面的评论：\n\n')
-
+                # after get all comment pages, initialize one weibo content and its comment list
                 one_content_and_comment['content'] = self.weibo_content[i]
                 one_content_and_comment['comment'] = []
                 start_idx = 0
                 end_idx = int(all_comment_pages) - 2
                 if i == start_scrap_index + 1 and content_and_comment:
+                    print('+'*30)
+                    print('\nTrying to recover from the last comment of last content...\n')
                     one_cac = content_and_comment[-1]
-                    # use the following judgement because the previous data don't have 'last_idx'
-                    if 'last_idx' in one_cac.keys():  
-                        print('\nTrying to recover from the last comment of last content...\n')
+                    if 'last_idx' in one_cac.keys():
                         if one_cac['last_idx'] + 1 < end_idx:
                             one_content_and_comment['comment'] = one_cac['comment']
                             start_idx = one_cac['last_idx'] + 1
                             print('last_idx: {}\n'.format(one_cac['last_idx']))
 
+                # start scrapping each page of comments
+                start_time = time.time()
+                self.rest_page = np.random.randint(self.rest_min_page, self.rest_max_page)
+                print('\n\nself.rest_page: {}\n\n'.format(self.rest_page))
+                no_content_pages = 0
                 for page in range(start_idx, end_idx):
-                    print('\n---- current solving page {} of {}'.format(page, int(all_comment_pages) - 3))
-                    if page % 5 == 0:
+                    if no_content_pages > self.raise_error_page:
+                        # record the error page
+                        if i == self.error_page:
+                            print('\n----- skip page %d -----\n '%i)
+                            break
+                        else:
+                            self.error_page = i 
+                            raise AccountBanned()
+                    print('\n---- current solving page {} of {}'.format(page, end_idx - 1))
+                    if (page + 1) % self.rest_page == 0:
                         self.rest_time = np.random.randint(self.rest_min_time, self.rest_max_time)
-                        print('[ATTEMPTING] rest for %ds to cheat weibo site, avoid being banned.' % self.rest_time)
+                        print('[ATTEMPTING] rest for %ds to cheat weibo site, avoid being banned.'%self.rest_time)
                         time.sleep(self.rest_time)
 
                     # we crawl from page 2, cause front pages have some noise
                     detail_comment_url = url + '&page=' + str(page + 2)
-                    no_content_pages = []
                     try:
                         # from every detail comment url we will got all comment
                         html_detail_page = requests.get(detail_comment_url, cookies=self.cookie).content
                         selector_comment = etree.HTML(html_detail_page)
 
                         comment_div_element = selector_comment.xpath('//div[starts-with(@id, "C_")]')
+                        if not comment_div_element:
+                            no_content_pages += 1
+                            print('\nself.no_content_pages: %d\n'%no_content_pages)
 
                         for child in comment_div_element:
                             single_comment_user_name = child.xpath('a[1]/text()')[0]
@@ -461,41 +497,54 @@ class WeiBoScraper(object):
                                 span_element = child.xpath('span[1]')[0]
                                 at_user_name = span_element.xpath('a/text()')[0]
                                 at_user_name = '$' + at_user_name.split('@')[-1] + '$'
-                                single_comment_content = span_element.xpath('/text()')
-                                single_comment_content.insert(1, at_user_name)
-                                single_comment_content = ' '.join(single_comment_content)
+                                try :
+                                    single_comment_content = span_element.xpath('text()')[1]
+                                except Exception as e:
+                                    #print('\nThis weibo reply has not comment.\n')
+                                    continue
 
                             full_single_comment = '<' + single_comment_user_name + '>' + ': ' + single_comment_content
                             print(full_single_comment)
                             one_content_and_comment['comment'].append(full_single_comment)
                             one_content_and_comment['last_idx'] = page
                     except etree.XMLSyntaxError as e:
-                        no_content_pages.append(page)
+                        no_content_pages += 1
                         print('\n\nThis page has no contents and is passed: ', e)
-                        print('Total no_content_pages: {}'.format(len(no_content_pages)))
-
+                        print('Total no_content_pages: {}'.format(no_content_pages))
                     except Exception as e:
                         print('Raise Exception in _get_weibo_content_and_comment, error:', e)
                         print('\n' * 2)
                         print('=' * 20)
                         print('weibo user {} content_and_comment scrap error occured {}.'.format(self.user_name, e))
-                        self._save_content_and_comment(i, one_content_and_comment, weibo_detail_urls)
+                        self._save_content_and_comment(i-1, one_content_and_comment, weibo_detail_urls)
                         print("\n\nComments are successfully save:\n User name: {}\n weibo content: {}\n\n".format(
                             self.user_name, one_content_and_comment['content']))
-                # save every one_content_and_comment
+
+                # save one_content_and_comment
+                end_time = time.time()
                 self._save_content_and_comment(i, one_content_and_comment, weibo_detail_urls)
-                print('weibo scrap done!')
-                self.mark_as_scraped(self.scrap_id)
-                print('*' * 30)
+                print('*'*30)
                 print("\n\nComments are successfully save:\n User name: {}\n weibo content: {}".format(
                     self.user_name, one_content_and_comment['content']))
+                print('-----Total time cost of scrapping this weibo: %ds -----\n\n'%(end_time-start_time))
+        except AccountBanned as e:
+            print('Raise Exception in _get_weibo_content_and_comment, error:', e.msg)
+            self._save_content_and_comment(i-1, one_content_and_comment, weibo_detail_urls)
+            raise AccountBanned()
+        except CookiesOutdated as e:
+            raise CookiesOutdated()
         except KeyboardInterrupt:
-            print('manually interrupted.. try save wb_content_and_comment for now...')
-            self._save_content_and_comment(i - 1, one_content_and_comment, weibo_detail_urls)
+            print('\nManually interrupted.. try save wb_content_and_comment for now...')
+            self._save_content_and_comment(i-1, one_content_and_comment, weibo_detail_urls)
+            print('Program exit!\n')
+            exit()
 
-        print('\n' * 2)
-        print('=' * 20)
+        print('\n'*2)
+        print('='*20)
         print('user {}, all weibo content and comment finished.'.format(self.user_name))
+        print('[CHEER] weibo content and comment saved into {} successfully.'.format(
+                self.weibo_content_and_comment_save_file))
+
 
     def _save_content_and_comment(self, i, one_content_and_comment, weibo_detail_urls):
         dump_dict = dict()
@@ -520,7 +569,8 @@ class WeiBoScraper(object):
             }
         with open(self.weibo_content_and_comment_save_file, 'wb') as f:
             print('try saving weibo content and comment for now.')
-            pickle.dump(dump_dict, f)
+            pickle.dump(dump_dict, f)   
+
 
     def switch_account(self, new_account):
         assert new_account.isinstance(str), 'account must be string'
@@ -534,9 +584,9 @@ class WeiBoScraper(object):
         """
         scraped_ids = []
         if os.path.exists(SCRAPED_MARK):
-            with open(SCRAPED_MARK, 'rb') as f:
-                scraped_ids = pickle.load(f)
-        scraped_ids.append(scrap_id)
-        with open(SCRAPED_MARK, 'wb') as f:
-            pickle.dump(scraped_ids, f)
+            with open(SCRAPED_MARK) as f:
+                scraped_ids = f.read().split('\n')
+        scraped_ids.append(str(scrap_id))
+        with open(SCRAPED_MARK, 'w') as f:
+            f.write('\n'.join(scraped_ids))
         print('scrap id {} marked as scraped, next time will jump this id directly.'.format(scrap_id))
